@@ -62,7 +62,7 @@ let package = Package(
         // respects each compiled Metal kernel's threadgroup limit.
         .package(
             url: "https://github.com/JamesPriceZV/mlx-swift",
-            revision: "be924b0"
+            revision: "95c48ee"
         ),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
