@@ -311,7 +311,8 @@ struct FoundationModelsToolCallingTests {
         for try await event in stream {
             if case .appendText(let text, _, .response) = event { response += text }
             if case .updateMetadata(let metadata, _) = event {
-                sawIncompleteOutput = (metadata["incompleteOutput"] as? Bool) == true
+                sawIncompleteOutput =
+                    (try? metadata["incompleteOutput"]?.value(Bool.self)) == true
             }
         }
 

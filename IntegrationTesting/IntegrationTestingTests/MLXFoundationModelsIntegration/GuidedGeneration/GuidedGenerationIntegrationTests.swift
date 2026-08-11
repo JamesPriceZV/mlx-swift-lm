@@ -304,7 +304,7 @@ struct GuidedGenerationIntegrationTests {
 
         let incompleteIdx = events.firstIndex { event in
             guard case .updateMetadata(let metadata, _) = event else { return false }
-            return (metadata["incompleteOutput"] as? Bool) == true
+            return (try? metadata["incompleteOutput"]?.value(Bool.self)) == true
         }
         #expect(
             incompleteIdx != nil,

@@ -81,6 +81,30 @@ struct GenerationEventObserverTests {
         #expect(arguments == "{\"a\":1}")
     }
 
+    @Test("metadata is eagerly mirrored as Sendable GeneratedContent")
+    func mirrorsMetadataAsGeneratedContent() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let values: [String: any ConvertibleToGeneratedContent] = [
+            "ready": true,
+            "modelID": "test/model",
+        ]
+        let events = await capture { channel in
+            await MLXLanguageModel.Executor.emitMetadata(
+                values,
+                entryID: "e1",
+                into: channel
+            )
+        }
+
+        guard case .updateMetadata(let metadata, "e1") = events.first else {
+            Issue.record("expected .updateMetadata mirror, got \(String(describing: events.first))")
+            return
+        }
+        #expect(try metadata["ready"]?.value(Bool.self) == true)
+        #expect(try metadata["modelID"]?.value(String.self) == "test/model")
+    }
+
     @Test("no observer attached means no crash and events are simply sent")
     func noObserverIsSafe() async {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
