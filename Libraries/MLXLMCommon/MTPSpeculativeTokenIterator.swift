@@ -57,6 +57,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
+
+    /// The MLX fault that ended generation early, if one occurred.
+    ///
+    /// A compute failure leaves the round's arrays without buffers and the
+    /// caches partially advanced, so neither can be trusted for a further
+    /// forward. The iterator records the fault, stops, and publishes it here:
+    /// `next()` returning `nil` otherwise looks exactly like a normal end of
+    /// generation, which would turn a hardware or shape failure into a
+    /// silently truncated answer.
+    public private(set) var generationFault: (any Error)?
     /// Number of pending tokens already represented by `mainCache`. The last
     /// verifier sample is not committed until a later forward pass.
     private var committedPendingTokenCount = 0
@@ -361,9 +371,25 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             mainTokens = sampler.sample(logits: verifyLogits)
         }
 
-        eval(mainTokens, flatDraftTokens)
-        let mainTokensList = mainTokens.asArray(Int.self)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
+        // Check the error box between the evaluation and the reads: a failed
+        // `eval` returns after invoking the MLX error handler, leaving these
+        // arrays without buffers, so reading one dereferences null and the
+        // fault resurfaces as EXC_BAD_ACCESS on an innocent-looking line.
+        let mainTokensList: [Int]
+        let draftTokensList: [Int]
+        do {
+            (mainTokensList, draftTokensList) = try withError { error in
+                eval(mainTokens, flatDraftTokens)
+                try error.check()
+                return (
+                    mainTokens.asArray(Int.self),
+                    flatDraftTokens.asArray(Int.self)
+                )
+            }
+        } catch {
+            generationFault = error
+            return
+        }
 
         var accepted = 0
         for i in 0 ..< numDraft {
@@ -468,8 +494,17 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         logits = processor?.process(logits: logits) ?? logits
         let token = sampler.sample(logits: logits)
         processor?.didSample(token: token)
-        eval(token)
-        let tokenInt = token.item(Int.self)
+        let tokenInt: Int
+        do {
+            tokenInt = try withError { error in
+                eval(token)
+                try error.check()
+                return token.item(Int.self)
+            }
+        } catch {
+            generationFault = error
+            return nil
+        }
         y = .init(tokens: token)
         kvCachePlan.apply(to: mainCacheStorage)
         return tokenInt
@@ -477,6 +512,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     public mutating func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        // A faulted round leaves the caches partially advanced against tokens
+        // that were never emitted, so running another forward would compound
+        // the failure rather than recover from it.
+        if generationFault != nil {
             return nil
         }
 
