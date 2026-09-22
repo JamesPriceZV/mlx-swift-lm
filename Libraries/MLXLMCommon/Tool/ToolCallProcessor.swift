@@ -505,7 +505,8 @@ public class ToolCallProcessor {
                 } else {
                     recordResponse(leadingToken ?? "")
                     leadingTokenWasRecorded = true
-                    return nil
+                    // The legacy API must emit the prefix before buffering the tag.
+                    return leadingToken?.isEmpty == false ? leadingToken : nil
                 }
             } else {
                 // Otherwise, return the collected text and reset the state.
@@ -569,7 +570,8 @@ public class ToolCallProcessor {
                 return combine(leadingToken, combine(bufferedToolCall, trailingToken))
             }
 
-            return nil
+            // The call may span chunks; its leading response text is already complete.
+            return leadingToken?.isEmpty == false ? leadingToken : nil
 
         case .collectingJSONToolCall:
             return processCollectingJSONToolCall(
