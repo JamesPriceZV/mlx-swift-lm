@@ -3,6 +3,82 @@ import MLXLMCommon
 import Testing
 
 struct ToolTests {
+    @Test("Tag-only chunks stay buffered without empty legacy output")
+    func emptyToolPrefixRemainsNil() {
+        let processor = ToolCallProcessor(format: .json)
+        #expect(processor.processChunk("<") == nil)
+        #expect(processor.processChunk("tool_call>{\"name\":\"lookup\",") == nil)
+        #expect(processor.processChunk("\"arguments\":{}}</tool_call>") == nil)
+        #expect(processor.drainToolCalls().map(\.function.name) == ["lookup"])
+    }
+
+    @Test("Legacy and ordered streaming preserve ordinary text at every split")
+    func ordinaryTextPrefixPreservation() {
+        let samples = [
+            "while left < right", "values[index..<endIndex]",
+            "injected as a `<memory>` block", "func f<T>()", "Note: <",
+        ]
+        for format in [ToolCallFormat.json, .xmlFunction] {
+            for sample in samples {
+                let characters = Array(sample)
+                for split in 0 ... characters.count {
+                    let chunks = [String(characters[..<split]), String(characters[split...])]
+                    let legacy = ToolCallProcessor(format: format)
+                    var text = chunks.compactMap { legacy.processChunk($0) }.joined()
+                    text += legacy.processEOS(returnBufferedText: true) ?? ""
+                    #expect(text == sample)
+                    #expect(legacy.drainToolCalls().isEmpty)
+
+                    let ordered = ToolCallProcessor(format: format)
+                    var outputs = chunks.flatMap { ordered.processChunkOutputs($0) }
+                    outputs += ordered.processEOSOutputs()
+                    let orderedText = outputs.compactMap { output -> String? in
+                        if case .response(let text) = output { return text }
+                        return nil
+                    }.joined()
+                    #expect(orderedText == sample)
+                    #expect(
+                        outputs.allSatisfy {
+                            if case .response = $0 { return true }
+                            return false
+                        })
+                }
+            }
+        }
+    }
+
+    @Test("Legacy streaming preserves leading text around split real calls")
+    func realToolCallPrefixPreservation() {
+        let variants = [
+            ["before <", "tool_call>{\"name\":\"lookup\",\"arguments\":{}", "}</tool_call>after"],
+            ["before <tool_call>{\"name\":\"lookup\",", "\"arguments\":{}}</tool_call>after"],
+        ]
+        for chunks in variants {
+            let legacy = ToolCallProcessor(format: .json)
+            var text = chunks.compactMap { legacy.processChunk($0) }.joined()
+            text += legacy.processEOS(returnBufferedText: true) ?? ""
+            #expect(text == "before after")
+            #expect(legacy.drainToolCalls().map(\.function.name) == ["lookup"])
+            #expect(legacy.drainToolCalls().isEmpty)
+
+            let ordered = ToolCallProcessor(format: .json)
+            var outputs = chunks.flatMap { ordered.processChunkOutputs($0) }
+            outputs += ordered.processEOSOutputs()
+            let response = outputs.compactMap { output -> String? in
+                if case .response(let text) = output { return text }
+                return nil
+            }.joined()
+            let calls = outputs.compactMap { output -> ToolCall? in
+                if case .toolCall(let call) = output { return call }
+                return nil
+            }
+            #expect(response == "before after")
+            #expect(calls.map(\.function.name) == ["lookup"])
+            #expect(outputs.first == .response("before "))
+            #expect(outputs.last == .response("after"))
+        }
+    }
+
     @Test("ChatConventionsProviding defaults to nil for both properties")
     func chatConventionsOptInDefaults() {
         struct Bare: ChatConventionsProviding {}
