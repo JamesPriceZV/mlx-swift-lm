@@ -33,7 +33,7 @@ import MLX
 /// args; drafter holds no target-derived state — the target and optional
 /// per-stream drafter cache are passed as parameters to `draftBlock(...)` so
 /// drafter instances are safe to share across iterators).
-public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
+public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol, GenerationFaultRecording {
 
     var y: LMInput.Text
 
@@ -58,6 +58,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
+    /// MLX fault that ended generation. A nil `next()` is otherwise indistinguishable from EOS.
+    public private(set) var generationFault: (any Error)?
     /// Number of pending tokens already represented by `mainCache`. The last
     /// verifier sample is not committed until a later forward pass.
     private var committedPendingTokenCount = 0
@@ -258,7 +260,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             // the iterator silently starts 1 position ahead of an
             // equivalent autoregressive run, violating speculative
             // decoding's bit-exact-equivalence-to-greedy guarantee.
-            pendingTokens.append(token.item(Int.self))
+            pendingTokens.append(
+                try readAfterSettledEval({ eval(token) }, { token.item(Int.self) }))
 
             // the model reported per-chunk progress; the bonus forward above
             // consumed the remainder of the prompt
@@ -318,13 +321,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 // re-prime forward, now committed in cache); `newToken` is
                 // the prefill-position-N+1 sample that becomes the input
                 // to the first speculateRound.
-                pendingTokens.append(token.item(Int.self))
-                pendingTokens.append(newToken.item(Int.self))
+                pendingTokens.append(
+                    try readAfterSettledEval({ eval(token) }, { token.item(Int.self) }))
+                pendingTokens.append(
+                    try readAfterSettledEval({ eval(newToken) }, { newToken.item(Int.self) }))
                 committedPendingTokenCount = 1
             } else {
                 // Prefill state already carried drafter keys; the single
                 // bonus is the input to the first speculateRound.
-                pendingTokens.append(token.item(Int.self))
+                pendingTokens.append(
+                    try readAfterSettledEval({ eval(token) }, { token.item(Int.self) }))
             }
         }
 
@@ -419,6 +425,23 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             return
         }
 
+        // The staged round is one transaction. Commit keeps a prefix and clears the open
+        // round. An eval fault returns while that round is still open; this rolls it back
+        // through storage (`rollback` is `commit(retaining: 0)`) and restores the pre-round
+        // hidden and shared-K/V snapshot. A post-commit exit finds the round already cleared.
+        // On that fault the iterator drops its drafter state. Those cache entries are
+        // reference objects, so a struct copy would still alias the failed proposal.
+        let preRoundState = mainState
+        defer {
+            if let round, mainCacheStorage.roundIsOpen {
+                mainCacheStorage.rollback(round)
+                mainState = preRoundState
+                if generationFault != nil {
+                    drafterState = nil
+                }
+            }
+        }
+
         // Slice the hidden at the slot that produced the newly-accepted
         // bonus's prediction. Round 1: last (and only) position. Round 2+:
         // index `lastRoundAccepted`, matching mlx-lm's
@@ -498,8 +521,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainLogits = mainResult.logits
         mainState = mainResult.state
 
-        eval(flatDraftTokens)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
+        guard
+            let draftTokensList = capturingGenerationFault(&generationFault, {
+                try readAfterSettledEval({ eval(flatDraftTokens) }) {
+                    flatDraftTokens.asArray(Int.self)
+                }
+            })
+        else {
+            pendingTokens.removeAll(keepingCapacity: true)
+            return
+        }
 
         var accepted = 0
         var finalToken: MLXArray?
@@ -507,8 +538,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             var logits = mainLogits[0..., verifyStart + i, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
+            guard
+                let targetTokenValue = capturingGenerationFault(&generationFault, {
+                    try readAfterSettledEval({ eval(targetToken) }) {
+                        targetToken.item(Int.self)
+                    }
+                })
+            else {
+                pendingTokens.removeAll(keepingCapacity: true)
+                return
+            }
             processor?.didSample(token: targetToken)
             pendingTokens.append(targetTokenValue)
             guard targetTokenValue == draftTokensList[i] else {
@@ -524,9 +563,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             var logits = mainLogits[0..., verifyStart + accepted, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let bonus = sampler.sample(logits: logits)
-            eval(bonus)
+            guard
+                let bonusValue = capturingGenerationFault(&generationFault, {
+                    try readAfterSettledEval({ eval(bonus) }, { bonus.item(Int.self) })
+                })
+            else {
+                pendingTokens.removeAll(keepingCapacity: true)
+                return
+            }
             processor?.didSample(token: bonus)
-            pendingTokens.append(bonus.item(Int.self))
+            pendingTokens.append(bonusValue)
             finalToken = bonus
         }
         let emittedFinalToken = finalToken!
@@ -634,8 +680,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         logits = processor?.process(logits: logits) ?? logits
         let token = sampler.sample(logits: logits)
         processor?.didSample(token: token)
-        eval(token)
-        let tokenInt = token.item(Int.self)
+        guard
+            let tokenInt = capturingGenerationFault(&generationFault, {
+                try readAfterSettledEval({ eval(token) }, { token.item(Int.self) })
+            })
+        else {
+            return nil
+        }
         y = .init(tokens: token)
         kvCachePlan.apply(to: mainCacheStorage)
         return tokenInt
@@ -643,6 +694,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     public mutating func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+        // Stay terminal after any recorded fault. Cache rollback in this repair covers
+        // a staged round only. Native hybrid (`round == nil`) and `passthroughStep`
+        // faults remain separate qualification limits.
+        if generationFault != nil {
             return nil
         }
 
@@ -673,6 +730,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         pendingIndex = 0
         committedPendingTokenCount = 0
         autoreleasepool { speculateRound() }
+
+        if generationFault != nil {
+            return nil
+        }
 
         if pendingTokens.isEmpty {
             // speculateRound chose passthrough -- fall through.

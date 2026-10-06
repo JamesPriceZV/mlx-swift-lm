@@ -686,6 +686,49 @@ extension TokenIteratorProtocol {
     public mutating func discardGeneratedToken() {}
 }
 
+/// Concrete iterators that publish `generationFault`. Not a public protocol.
+protocol GenerationFaultRecording: TokenIteratorProtocol {
+    var generationFault: (any Error)? { get }
+}
+
+/// Evaluates, then reads. A failed eval leaves the arrays without buffers.
+func readAfterSettledEval<T>(_ evaluate: () -> Void, _ read: () -> T) throws -> T {
+    try withError { error in
+        evaluate()
+        try error.check()
+        return read()
+    }
+}
+
+/// Records a compute fault and returns nil so the caller does not forward again.
+func capturingGenerationFault<T>(_ fault: inout (any Error)?, _ work: () throws -> T) -> T? {
+    if fault != nil {
+        return nil
+    }
+    do {
+        return try work()
+    } catch {
+        fault = error
+        return nil
+    }
+}
+
+/// End of iteration when no EOS token was seen. A fault is not a budget stop.
+func stopReasonForIteratorEnd(
+    taskCancelled: Bool,
+    generationFault: (any Error)?,
+    tokenCount: Int,
+    maxTokens: Int?
+) -> GenerateStopReason {
+    if taskCancelled || generationFault != nil {
+        return .cancelled
+    }
+    if let maxTokens, tokenCount >= maxTokens {
+        return .length
+    }
+    return .cancelled
+}
+
 /// Generator of tokens.
 ///
 /// This is typically used via a call to ``generate(input:cache:state:parameters:context:components:wiredMemoryTicket:tools:)`` returning `AsyncStream<Generation>`.
@@ -709,7 +752,7 @@ extension TokenIteratorProtocol {
 /// Port of `generate_step()` from https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/utils.py
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
-public struct TokenIterator: TokenIteratorProtocol {
+public struct TokenIterator: TokenIteratorProtocol, GenerationFaultRecording {
     let model: any LanguageModel
 
     /// Per-call model state (e.g. M-RoPE rope deltas), seeded from the
@@ -729,6 +772,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     let sampler: LogitSampler
 
     public var tokenCount = 0
+    /// MLX fault that ended generation. A nil `next()` is otherwise indistinguishable from EOS.
+    public private(set) var generationFault: (any Error)?
     public let maxTokens: Int?
 
     var kvCachePlan: KVCachePlan { cacheStorage.plan }
@@ -930,6 +975,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
+        // The failed step already advanced the cache for a token that was not emitted.
+        if generationFault != nil {
+            return nil
+        }
 
         // Drain autoreleased MLX temporaries every step: a full model forward
         // produces hundreds of autoreleased wrapper objects, and the token
@@ -958,7 +1007,12 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             tokenCount += 1
 
-            return previousY.tokens.item(Int.self)
+            // `asyncEval` settles inside this read. Check the error box first.
+            return capturingGenerationFault(&generationFault) {
+                try readAfterSettledEval({ eval(previousY.tokens) }) {
+                    previousY.tokens.item(Int.self)
+                }
+            }
         }
     }
 }
@@ -988,7 +1042,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 /// Tokens are integers that can be passed through a `Tokenizer` or ``StreamingDetokenizer`` to produce Strings.
 ///
 /// Port of `speculative_generate_step()` from https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
-public struct SpeculativeTokenIterator: TokenIteratorProtocol {
+public struct SpeculativeTokenIterator: TokenIteratorProtocol, GenerationFaultRecording {
 
     var y: LMInput.Text
     var draftY: LMInput.Text
@@ -1022,6 +1076,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     let sampler: LogitSampler
 
     public var tokenCount: Int { telemetry.emittedTokenCount }
+    /// MLX fault that ended generation. A nil `next()` is otherwise indistinguishable from EOS.
+    public private(set) var generationFault: (any Error)?
     public let maxTokens: Int?
     let numDraftTokens: Int
 
@@ -1239,10 +1295,20 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             mainTokens = sampler.sample(logits: verifyLogits)
         }
 
-        // Compare and accept proposed tokens
-        eval(mainTokens, draftTokens)
-        let mainTokensList = mainTokens.asArray(Int.self)
-        let draftTokensList = concatenated(draftTokens).asArray(Int.self)
+        // Compare and accept proposed tokens. Check the error box before the reads.
+        guard
+            let settled = capturingGenerationFault(&generationFault, {
+                try readAfterSettledEval({ eval(mainTokens, draftTokens) }) {
+                    (
+                        mainTokens.asArray(Int.self),
+                        concatenated(draftTokens).asArray(Int.self)
+                    )
+                }
+            })
+        else {
+            return
+        }
+        let (mainTokensList, draftTokensList) = settled
         var accepted = 0
         for i in 0 ..< numDraft {
             guard mainTokensList[i] == draftTokensList[i] else {
@@ -1300,6 +1366,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
+        // A faulted round leaves both caches partially advanced.
+        if generationFault != nil {
+            return nil
+        }
 
         // Drain the pending buffer first
         if pendingIndex < pendingTokens.count {
@@ -1318,7 +1388,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         draftCommittedPendingTokenCount = 0
         autoreleasepool { speculateRound() }
 
-        if pendingTokens.isEmpty {
+        if generationFault != nil || pendingTokens.isEmpty {
             return nil
         }
 
@@ -1505,13 +1575,13 @@ private func runSynchronousGenerationLoop(
         }
     }
 
-    // If the iterator ends naturally, the max-token limit was reached.
+    // EOS is assigned above. A fault must not be reported as a budget stop.
     if stopReason == nil {
-        if let maxTokens = iterator.maxTokens, iterator.tokenCount >= maxTokens {
-            stopReason = .length
-        } else {
-            stopReason = .cancelled
-        }
+        stopReason = stopReasonForIteratorEnd(
+            taskCancelled: false,
+            generationFault: iterator.generationFault,
+            tokenCount: iterator.tokenCount,
+            maxTokens: iterator.maxTokens)
     }
 
     let now = Date.timeIntervalSinceReferenceDate
@@ -2422,13 +2492,12 @@ private func generateLoopTask<
             }
 
             if stopReason == nil {
-                if Task.isCancelled {
-                    stopReason = .cancelled
-                } else if let maxTokens = iterator.maxTokens, iterator.tokenCount >= maxTokens {
-                    stopReason = .length
-                } else {
-                    stopReason = .cancelled
-                }
+                let fault = (iterator as? any GenerationFaultRecording)?.generationFault
+                stopReason = stopReasonForIteratorEnd(
+                    taskCancelled: Task.isCancelled,
+                    generationFault: fault,
+                    tokenCount: iterator.tokenCount,
+                    maxTokens: iterator.maxTokens)
             }
 
             // Speculative iterators verify several candidates at once. A stop
